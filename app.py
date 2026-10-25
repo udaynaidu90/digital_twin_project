@@ -25,12 +25,18 @@ from tensorflow import keras
 
 from data_loader import (
     SENSOR_COLUMNS,
-    load_dataset
+    load_dataset,
+    get_machine_ids
 )
 
 from db_utils import (
+    init_db,
+    insert_reading,
     get_latest_readings
 )
+
+from simulate_stream import create_live_row
+from datetime import datetime
 
 
 # ============================================================
@@ -62,6 +68,71 @@ REFRESH_SECONDS = 2
 GRAPH_POINTS = 30
 
 MAX_RUL = 140
+
+
+# ============================================================
+# CLOUD DEMO DATA GENERATOR
+# Streamlit Community Cloud starts app.py, not simulate_stream.py.
+# Generate one new reading per machine on each dashboard rerun.
+# ============================================================
+
+@st.cache_data
+def load_simulation_source():
+    """Load source rows once; cache them for the active app process."""
+    return load_dataset()
+
+
+def update_simulated_readings():
+    """
+    Insert one simulated reading per machine before the dashboard reads
+    SQLite. This makes the demo work when only app.py is started on Cloud.
+    """
+    init_db()
+    source_df = load_simulation_source()
+
+    if source_df is None or source_df.empty:
+        raise RuntimeError(
+            "No source dataset found. Check that the data file required "
+            "by data_loader.py is included in your GitHub repository."
+        )
+
+    machine_ids = get_machine_ids(source_df)
+    latest_df = get_latest_readings(limit_per_machine=1)
+
+    for machine_id in machine_ids:
+        source_rows = (
+            source_df[source_df["unit_number"] == machine_id]
+            .sort_values("time_in_cycles")
+            .to_dict("records")
+        )
+        if not source_rows:
+            continue
+
+        if (
+            latest_df is not None
+            and not latest_df.empty
+            and "unit_number" in latest_df.columns
+        ):
+            machine_latest = latest_df[
+                latest_df["unit_number"] == machine_id
+            ]
+        else:
+            machine_latest = pd.DataFrame()
+
+        current_cycle = (
+            int(machine_latest["time_in_cycles"].iloc[-1])
+            if not machine_latest.empty
+            else 0
+        )
+        next_cycle = current_cycle + 1
+        base_row = source_rows[(next_cycle - 1) % len(source_rows)]
+
+        live_row = create_live_row(
+            base_row=base_row,
+            machine_id=int(machine_id),
+            live_cycle=next_cycle
+        )
+        insert_reading(live_row, datetime.now().isoformat())
 
 
 # ============================================================
@@ -761,6 +832,17 @@ def main():
 
         st.exception(e)
 
+        return
+
+    # --------------------------------------------------------
+    # GENERATE CLOUD DEMO READINGS
+    # --------------------------------------------------------
+
+    try:
+        update_simulated_readings()
+    except Exception as e:
+        st.error("Could not generate live demo readings.")
+        st.exception(e)
         return
 
     # --------------------------------------------------------
